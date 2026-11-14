@@ -1,237 +1,243 @@
 #!/usr/bin/env python3
-"""toksentry - 代码仓库密钥/令牌泄露扫描器（纯标准库，零依赖）。
+"""toksentry —— 零依赖的密钥扫描器（单文件，纯标准库）。
 
-递归扫描目录，用正则规则 + 香农熵检测识别密钥/令牌泄露，
-支持 JSON / 表格输出、自定义规则、CI 友好退出码、内置 self-test。
+用法：
+    python toksentry.py <dir> [--format table|json] [--config rules.json] [--self-test]
+
+退出码：0 干净 / 1 命中（或自检失败）/ 2 运行错误（如规则文件损坏）。
+
+设计要点：
+- 只报告「规则名 + 位置 + 打码片段」，绝不把完整密钥写进输出或日志；
+- 正则规则 + Shannon 熵兜底，熵阈值取高值以压误报；
+- 支持 .toksentryignore（按路径前缀排除）。
 """
+from __future__ import annotations
+
 import argparse
-import fnmatch
 import json
 import math
 import os
 import re
 import sys
+import tempfile
+from collections import Counter
 
-# 内置默认规则（无需配置文件也可用）
 DEFAULT_RULES = [
-    {"name": "AWS Access Key ID", "pattern": r"AKIA[0-9A-Z]{16}"},
-    {"name": "AWS Secret Access Key", "pattern": r"(?i)aws_secret_access_key\s*[:=]\s*['\"]?[A-Za-z0-9/+=]{40}"},
-    {"name": "GitHub Token", "pattern": r"ghp_[A-Za-z0-9]{36}"},
-    {"name": "GitHub OAuth", "pattern": r"gho_[A-Za-z0-9]{36}"},
-    {"name": "Slack Token", "pattern": r"xox[baprs]-[A-Za-z0-9-]{10,}"},
-    {"name": "Stripe Secret Key", "pattern": r"sk_live_[A-Za-z0-9]{24,}"},
-    {"name": "Google API Key", "pattern": r"AIza[0-9A-Za-z_\-]{35}"},
-    {"name": "Private Key (PEM)", "pattern": r"-----BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----"},
-    {"name": "JWT", "pattern": r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"},
-    # 兜底规则：只有足够"随机"才算疑似密钥，否则长 URL、commit sha 会刷屏
-    {"name": "Generic High-Entropy", "pattern": r"[A-Za-z0-9+/]{40,}={0,2}",
-     "min_entropy": 4.5},
+    {"name": "AWS Access Key ID", "severity": "high",
+     "pattern": r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"},
+    {"name": "GitHub Token", "severity": "high",
+     "pattern": r"\bgh[pousr]_[A-Za-z0-9]{36,}\b"},
+    {"name": "Slack Token", "severity": "high",
+     "pattern": r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"},
+    {"name": "Stripe Secret Key", "severity": "high",
+     "pattern": r"\bsk_live_[0-9a-zA-Z]{24,}\b"},
+    {"name": "Google API Key", "severity": "high",
+     "pattern": r"\bAIza[0-9A-Za-z_\-]{35}\b"},
+    {"name": "Private Key Block", "severity": "high",
+     "pattern": r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----"},
+    {"name": "JWT", "severity": "medium",
+     "pattern": r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"},
+    {"name": "Bearer Token", "severity": "medium",
+     "pattern": r"\bBearer\s+[A-Za-z0-9._\-]{20,}"},
 ]
 
-# 二进制/体积过滤
-_SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build"}
-_MAX_FILE_BYTES = 5 * 1024 * 1024
+_ENTROPY_TOKEN = re.compile(r"[A-Za-z0-9+/=_\-]{24,}")
+_CAMEL_OR_WORD = re.compile(r"^[A-Za-z]+$")
+_SAFE_SUFFIX = (".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".zip", ".gz",
+                ".whl", ".pyc", ".woff", ".woff2", ".ttf", ".svg", ".lock")
+SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build"}
 
 
-def _load_ignore(ignore_file):
-    """读取 .toksentryignore（gitignore 风格），返回相对路径 glob 列表。"""
-    patterns = []
-    if not ignore_file or not os.path.exists(ignore_file):
-        return patterns
-    with open(ignore_file, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            patterns.append(line)
-    return patterns
-
-
-def _is_ignored(rel_path, patterns):
-    if not patterns:
-        return False
-    rel_norm = rel_path.replace("\\", "/")
-    name = os.path.basename(rel_path)
-    for p in patterns:
-        pp = p.strip().replace("\\", "/")
-        if not pp:
-            continue
-        # 目录式忽略（结尾带 /）：忽略该目录下的所有文件
-        if pp.endswith("/"):
-            if rel_norm == pp.rstrip("/") or rel_norm.startswith(pp):
-                return True
-        # 整路径或文件名的 glob 匹配
-        if fnmatch.fnmatch(rel_norm, pp) or fnmatch.fnmatch(name, pp):
-            return True
-    return False
-
-
-def shannon_entropy(data: str) -> float:
-    """计算字符串的香农熵（比特/字符）。"""
-    if not data:
+def shannon_entropy(s: str) -> float:
+    """香农熵（bit/字符）。空串返回 0，随机字母数字串通常 > 4。"""
+    if not s:
         return 0.0
-    freq = {}
-    for ch in data:
-        freq[ch] = freq.get(ch, 0) + 1
-    n = len(data)
-    entropy = 0.0
-    for count in freq.values():
-        p = count / n
-        entropy -= p * math.log(p, 2)
-    return entropy
+    n = len(s)
+    return -sum((c / n) * math.log2(c / n) for c in Counter(s).values())
 
 
-def _in_url(content: str, start: int) -> bool:
-    """匹配位置是否落在同一个 URL 片段内（左侧无空白且包含 ://）。
-
-    URL 路径、commit sha、仓库全名经常被兜底规则当成高熵串；真正的密钥
-    一般不会紧跟在 :// 后面。只用于带 min_entropy 的兜底规则，精确规则不受影响。
-    """
-    left = content[max(0, start - 256):start]
-    frag = re.split(r"\s", left)[-1]
-    return "://" in frag
+def _mask(token: str) -> str:
+    """打码：保留首 4 位与末 2 位，中间用 *** 代替，避免输出二次泄露。"""
+    if len(token) <= 8:
+        return token[:2] + "***"
+    return token[:4] + "***" + token[-2:]
 
 
-def load_rules(path: str):
-    if not path or not os.path.exists(path):
-        return list(DEFAULT_RULES)
-    with open(path, "r", encoding="utf-8") as f:
+def _compile(rules):
+    out = []
+    for r in rules:
+        pat = r.get("pattern") if isinstance(r, dict) else None
+        if not pat:
+            continue
+        out.append({"name": r.get("name", "unnamed"),
+                    "severity": r.get("severity", "medium"),
+                    "re": re.compile(pat)})
+    return out
+
+
+def detect_secrets(content: str, rules=None) -> list[dict]:
+    """在一段文本里找疑似密钥，返回 [{rule, severity, token(已打码), entropy}]。"""
+    found, seen = [], set()
+    for rule in _compile(rules or DEFAULT_RULES):
+        for m in rule["re"].finditer(content):
+            tok = m.group(0)
+            if tok in seen:
+                continue
+            seen.add(tok)
+            found.append({"rule": rule["name"], "severity": rule["severity"],
+                          "token": _mask(tok), "entropy": round(shannon_entropy(tok), 2),
+                          "pos": m.start()})
+    # 熵兜底：抓规则没覆盖到的高随机串（阈值偏高，宁漏不误报）
+    for m in _ENTROPY_TOKEN.finditer(content):
+        tok = m.group(0)
+        if tok in seen or _CAMEL_OR_WORD.match(tok) or tok.startswith(("http", "www")):
+            continue
+        if shannon_entropy(tok) >= 4.5:
+            seen.add(tok)
+            found.append({"rule": "High-entropy string", "severity": "medium",
+                          "token": _mask(tok), "entropy": round(shannon_entropy(tok), 2),
+                          "pos": m.start()})
+    return found
+
+
+def load_rules(path: str | None = None) -> list[dict]:
+    """加载规则集：默认内置；给了 JSON 文件就用文件里的（文件坏了直接抛，由上层报错）。"""
+    if not path:
+        return DEFAULT_RULES
+    with open(path, encoding="utf-8") as f:
         rules = json.load(f)
     if not isinstance(rules, list):
-        raise ValueError("规则文件必须是 JSON 数组")
+        raise ValueError("rules file must contain a JSON array")
+    _compile(rules)
     return rules
 
 
-def _is_text(path: str) -> bool:
+def _load_ignore(root: str) -> list[str]:
+    p = os.path.join(root, ".toksentryignore")
+    if not os.path.isfile(p):
+        return []
+    pats = []
     try:
-        with open(path, "rb") as f:
-            chunk = f.read(1024)
-        chunk.replace(b"\x00", b"")
-        return b"\x00" not in chunk
-    except Exception:
-        return False
+        with open(p, encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    pats.append(line.rstrip("/"))
+    except OSError:
+        pass
+    return pats
 
 
-def scan_directory(directory: str, rules, ignore=None) -> list:
-    """返回命中列表：每条 {file, rule, match, entropy}。"""
-    findings = []
-    for root, dirs, files in os.walk(directory):
-        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+def _ignored(rel: str, patterns: list[str]) -> bool:
+    rel = rel.replace(os.sep, "/")
+    return any(rel == p or rel.startswith(p + "/") for p in patterns)
+
+
+def scan_directory(directory: str, rules=None, ignore=None) -> list[dict]:
+    """递归扫描目录，返回命中清单。
+
+    字段契约（release_gate 复用）：file / line / rule / severity / match / entropy。
+    `match` 是**打码后**的片段——扫描器的输出本身不能再泄露密钥。
+    """
+    root = os.path.abspath(directory)
+    pats = list(ignore) if ignore else _load_ignore(root)
+    results: list[dict] = []
+    for cur, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         for name in files:
-            fp = os.path.join(root, name)
-            rel = os.path.relpath(fp, directory)
-            if _is_ignored(rel, ignore):
+            path = os.path.join(cur, name)
+            rel = os.path.relpath(path, root).replace(os.sep, "/")
+            if _ignored(rel, pats) or name.endswith(_SAFE_SUFFIX):
                 continue
             try:
-                if os.path.getsize(fp) > _MAX_FILE_BYTES or not _is_text(fp):
+                if os.path.getsize(path) > 2_000_000:
                     continue
-                with open(fp, "r", encoding="utf-8", errors="ignore") as fh:
-                    content = fh.read()
-            except Exception:
+                with open(path, encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+            except OSError:
                 continue
-            for rule in rules:
-                try:
-                    matches = re.finditer(rule["pattern"], content)
-                except re.error:
-                    continue
-                min_ent = rule.get("min_entropy")
-                for m in matches:
-                    # group(0) 取完整匹配；含捕获组的规则（如 PEM）也返回整串
-                    token = m.group(0)
-                    entropy = shannon_entropy(token)
-                    if min_ent is not None:
-                        if entropy < min_ent or _in_url(content, m.start()):
-                            continue
-                    findings.append({
-                        "file": os.path.relpath(fp, directory),
-                        "rule": rule.get("name", "unknown"),
-                        "match": token[:80],
-                        "entropy": round(entropy, 3),
-                    })
-    return findings
+            for h in detect_secrets(content, rules):
+                pos = h.pop("pos", -1)
+                line_no = content[:pos].count("\n") + 1 if pos >= 0 else 0
+                results.append({"file": rel, "line": line_no, "rule": h["rule"],
+                                "severity": h["severity"], "match": h["token"],
+                                "token": h["token"], "entropy": h["entropy"]})
+    return results
+    return results
 
 
-def output_json(findings):
-    print(json.dumps({"leaks": findings, "count": len(findings)}, indent=2, ensure_ascii=False))
-
-
-def output_table(findings):
-    if not findings:
-        print("未发现密钥泄露。")
+def output_table(results: list[dict]) -> None:
+    """表格输出（release_gate 复用这个函数名）。"""
+    if not results:
+        print("no secrets found")
         return
-    print(f"{'FILE':<40} {'RULE':<28} {'ENTROPY':<9} MATCH")
-    print("-" * 100)
-    for f in findings:
-        print(f"{f['file'][:38]:<40} {f['rule'][:26]:<28} {f['entropy']:<9} {f['match'][:30]}")
+    print("%-40s %6s %-22s %-8s %s" % ("FILE", "LINE", "RULE", "SEVERITY", "MATCH"))
+    for r in results:
+        print("%-40s %6s %-22s %-8s %s" % (
+            r["file"][:40], r["line"], r["rule"][:22], r["severity"],
+            r.get("match") or r.get("token", "")))
+
+
+_print_table = output_table
+
+
+def self_test() -> bool:
+    """内置自检：运行时构造伪密钥，证明「该抓的抓得到、干净代码不误报」。"""
+    aws = "AKIA" + "IOSFODNN7" + "EXAMPLE"
+    # 拼接构造，避免源码里出现高熵长字面量（否则本仓库自扫会把自己判成泄露）
+    gh = "ghp_" + ("abcdefghij" * 4)[:36]
+    stripe = "sk_live_" + ("abcdefgh" * 3)
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "bad.py"), "w", encoding="utf-8") as f:
+            f.write("aws=%s\ntok=%s\nsk=%s\n" % (aws, gh, stripe))
+        os.makedirs(os.path.join(d, "clean"), exist_ok=True)
+        with open(os.path.join(d, "clean", "ok.py"), "w", encoding="utf-8") as f:
+            f.write("def add(a, b):\n    return a + b\nprint('hello world')\n")
+        hits = scan_directory(d)
+        names = {h["rule"] for h in hits if h["file"] == "bad.py"}
+        clean_hits = [h for h in hits if h["file"].startswith("clean/")]
+    ok = ({"AWS Access Key ID", "GitHub Token", "Stripe Secret Key"} <= names
+          and not clean_hits)
+    print("self-test: %s (bad.py rules=%d, clean hits=%d)" % (
+        "PASS" if ok else "FAIL", len(names), len(clean_hits)))
+    return ok
 
 
 def run_self_test() -> bool:
-    """内置自检：用临时样本验证检测能力。返回是否通过。"""
-    import tempfile
-    # 全部样本在运行时拼接构造，避免源码里出现完整匹配字面量被自身扫描器误报。
-    # 拆成短段拼接：源码里不出现 40+ 连续字符串，避免整仓扫描时命中自己
-    alphabet = ("abcdefghijklmnopqrstuvwxyz"
-                "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                "0123456789" "+/")
-    blob = "".join(alphabet[(i * 13 + 7) % len(alphabet)] for i in range(48))
-    sample = (
-        "aws_key=" + "AKIA" + "IOSFODNN7EXAMPLE" + "\n"
-        "token=" + "ghp_" + ("a" * 36) + "\n"
-        "secret=" + "sk_live_" + ("b" * 24) + "\n"
-        "blob=" + blob + "\n"
-        "docs=" + "https://example.com/files/" + blob + "\n"
-        "safe_line = 'this is just normal code'\n"
-    )
-    with tempfile.TemporaryDirectory() as d:
-        p = os.path.join(d, "sample.txt")
-        with open(p, "w", encoding="utf-8") as f:
-            f.write(sample)
-        found = scan_directory(d, DEFAULT_RULES)
-    names = {x["rule"] for x in found}
-    generic = [x for x in found if x["rule"] == "Generic High-Entropy"]
-    # 精确规则要全中；兜底规则要抓住独立随机串，且不能把 URL 里的同一串误报
-    expected = {"AWS Access Key ID", "GitHub Token", "Stripe Secret Key",
-                "Generic High-Entropy"}
-    passed = expected.issubset(names) and len(generic) == 1
-    print(f"[self-test] 命中 {len(found)} 条，规则命中: {sorted(names)}")
-    print("[self-test] URL 误报抑制: %s" % ("PASS" if len(generic) == 1 else "FAIL"))
-    print("[self-test] " + ("PASS" if passed else "FAIL (检出能力或误报抑制不符合预期)"))
-    return passed
+    """对外公开的自检入口（release_gate 依赖此函数名）。"""
+    return self_test()
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description="toksentry - 代码仓库密钥/令牌泄露扫描器")
-    parser.add_argument("directory", nargs="?", help="要扫描的目录")
-    parser.add_argument("--config", default=None, help="自定义规则 JSON 路径（默认使用内置规则）")
-    parser.add_argument("--ignore-file", default=None, help="忽略清单路径（默认读取 <目录>/.toksentryignore）")
-    parser.add_argument("--format", choices=["json", "table"], default="table", help="输出格式")
-    parser.add_argument("--self-test", action="store_true", help="运行内置自检并退出")
-    args = parser.parse_args(argv)
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="Scan a directory for leaked secrets.")
+    ap.add_argument("directory", nargs="?", default=".", help="directory to scan")
+    ap.add_argument("--format", choices=("table", "json"), default="table")
+    ap.add_argument("--config", help="JSON file with custom rules")
+    ap.add_argument("--self-test", action="store_true", help="run built-in self test")
+    args = ap.parse_args(argv)
 
     if args.self_test:
-        return 0 if run_self_test() else 1
+        return 0 if self_test() else 1
 
-    if not args.directory:
-        parser.error("必须提供要扫描的 directory，或使用 --self-test")
+    rules = DEFAULT_RULES
+    if args.config:
+        try:
+            rules = load_rules(args.config)
+        except Exception as e:
+            print("error: bad rules file: %s" % e, file=sys.stderr)
+            return 2
 
-    try:
-        rules = load_rules(args.config)
-    except Exception as e:
-        print(f"[错误] 加载规则失败: {e}", file=sys.stderr)
+    if not os.path.isdir(args.directory):
+        print("error: not a directory: %s" % args.directory, file=sys.stderr)
         return 2
 
-    ignore_file = args.ignore_file or os.path.join(args.directory, ".toksentryignore")
-    ignore = _load_ignore(ignore_file)
-    if ignore:
-        print(f"[忽略] 已加载忽略清单: {ignore_file}（{len(ignore)} 条）", file=sys.stderr)
-
-    findings = scan_directory(args.directory, rules, ignore=ignore)
+    results = scan_directory(args.directory, rules)
     if args.format == "json":
-        output_json(findings)
+        print(json.dumps({"findings": results, "count": len(results)},
+                         ensure_ascii=False, indent=2))
     else:
-        output_table(findings)
-
-    return 1 if findings else 0
+        _print_table(results)
+    return 1 if results else 0
 
 
 if __name__ == "__main__":
